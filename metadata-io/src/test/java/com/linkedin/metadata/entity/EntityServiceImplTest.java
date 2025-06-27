@@ -3,7 +3,6 @@ package com.linkedin.metadata.entity;
 import static com.linkedin.metadata.Constants.DATASET_PROFILE_ASPECT_NAME;
 import static com.linkedin.metadata.Constants.STATUS_ASPECT_NAME;
 import static com.linkedin.metadata.Constants.UPSTREAM_LINEAGE_ASPECT_NAME;
-import static com.linkedin.metadata.entity.EntityServiceTest.TEST_AUDIT_STAMP;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -57,7 +56,9 @@ import com.linkedin.mxe.MetadataChangeProposal;
 import com.linkedin.mxe.SystemMetadata;
 import com.linkedin.util.Pair;
 import io.datahubproject.metadata.context.OperationContext;
+import io.datahubproject.metadata.context.SystemTelemetryContext;
 import io.datahubproject.test.metadata.context.TestOperationContexts;
+import io.opentelemetry.api.trace.Tracer;
 import jakarta.persistence.EntityNotFoundException;
 import java.sql.Timestamp;
 import java.util.ArrayList;
@@ -70,8 +71,6 @@ import java.util.concurrent.Future;
 import java.util.function.Function;
 import java.util.stream.Stream;
 import org.mockito.ArgumentCaptor;
-import org.mockito.MockedStatic;
-import org.mockito.Mockito;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
@@ -88,10 +87,12 @@ public class EntityServiceImplTest {
   private Status newAspect;
   private EntityServiceImpl entityService;
   private MetadataChangeProposal testMCP;
+  private AspectDao mockAspectDao;
 
   @BeforeMethod
   public void setup() throws Exception {
     mockEventProducer = mock(EventProducer.class);
+    mockAspectDao = mock(AspectDao.class);
 
     // Initialize common test objects
     entityService =
@@ -954,25 +955,28 @@ public class EntityServiceImplTest {
     // Create a counter mock
     Counter mockCounter = mock(Counter.class);
 
-    // Mock the static method
-    try (MockedStatic<MetricUtils> metricUtilsMock = Mockito.mockStatic(MetricUtils.class)) {
-      metricUtilsMock
-          .when(() -> MetricUtils.counter(eq(EntityServiceImpl.class), eq("delete_nonexisting")))
-          .thenReturn(mockCounter);
+    // Mock the metricUtils
+    MetricUtils metricUtils = mock(MetricUtils.class);
+    OperationContext testContext =
+        opContext.toBuilder()
+            .systemTelemetryContext(
+                SystemTelemetryContext.builder()
+                    .metricUtils(metricUtils)
+                    .tracer(mock(Tracer.class))
+                    .build())
+            .build(opContext.getSystemActorContext().getAuthentication(), false);
 
-      // Execute the method
-      RollbackResult result =
-          entityService.deleteAspectWithoutMCL(
-              opContext, testUrn.toString(), aspectName, conditions, true);
+    // Execute the method
+    RollbackResult result =
+        entityService.deleteAspectWithoutMCL(
+            testContext, testUrn.toString(), aspectName, conditions, true);
 
-      // Verify result is null
-      assertNull(result, "Result should be null when EntityNotFoundException is caught");
+    // Verify result is null
+    assertNull(result, "Result should be null when EntityNotFoundException is caught");
 
-      // Verify metric was incremented
-      metricUtilsMock.verify(
-          () -> MetricUtils.counter(EntityServiceImpl.class, "delete_nonexisting"));
-      verify(mockCounter).inc();
-    }
+    // Verify metric was incremented
+    verify(metricUtils, times(1))
+        .increment(eq(EntityServiceImpl.class), eq("delete_nonexisting"), eq(1d));
   }
 
   @Test
@@ -1035,5 +1039,68 @@ public class EntityServiceImplTest {
     assertNotNull(results);
     assertEquals(1, results.size());
     assertEquals(1, results.get(0).rowsMigrated);
+  }
+
+  @Test
+  public void testIngestAspectsWithDuplicates() throws Exception {
+    // Create duplicate aspects
+    // Create a batch with duplicate aspects (same urn and aspect name)
+    SystemMetadata metadata = SystemMetadataUtils.createDefaultSystemMetadata();
+    List<ChangeItemImpl> items =
+        List.of(
+            ChangeItemImpl.builder()
+                .urn(TEST_URN)
+                .aspectName(STATUS_ASPECT_NAME)
+                .recordTemplate(new Status().setRemoved(false))
+                .systemMetadata(metadata)
+                .auditStamp(TEST_AUDIT_STAMP)
+                .build(opContext.getAspectRetriever()),
+            ChangeItemImpl.builder()
+                .urn(TEST_URN)
+                .aspectName(STATUS_ASPECT_NAME)
+                .recordTemplate(new Status().setRemoved(true))
+                .systemMetadata(metadata)
+                .auditStamp(TEST_AUDIT_STAMP)
+                .build(opContext.getAspectRetriever()),
+            ChangeItemImpl.builder()
+                .urn(TEST_URN)
+                .aspectName(STATUS_ASPECT_NAME)
+                .recordTemplate(new Status().setRemoved(false))
+                .systemMetadata(metadata)
+                .auditStamp(TEST_AUDIT_STAMP)
+                .build(opContext.getAspectRetriever()));
+
+    AspectsBatchImpl aspectsBatch =
+        AspectsBatchImpl.builder()
+            .retrieverContext(opContext.getRetrieverContext())
+            .items(items)
+            .build(opContext);
+    assertTrue(aspectsBatch.containsDuplicateAspects(), "Expected duplicates.");
+
+    // Mock metric utils to verify the increment call
+    MetricUtils mockMetricUtils = mock(MetricUtils.class);
+    OperationContext testContext =
+        opContext.toBuilder()
+            .systemTelemetryContext(
+                SystemTelemetryContext.builder()
+                    .tracer(SystemTelemetryContext.TEST.getTracer())
+                    .metricUtils(mockMetricUtils)
+                    .build())
+            .build(opContext.getSystemActorContext().getAuthentication(), false);
+
+    // Mock the transaction to return an empty result
+    when(mockAspectDao.runInTransactionWithRetry(any(), any(), anyInt()))
+        .thenReturn(
+            Optional.of(
+                IngestAspectsResult.builder()
+                    .updateAspectResults(List.of(UpdateAspectResult.builder().build()))
+                    .build()));
+
+    // Execute
+    entityService.ingestAspects(testContext, aspectsBatch, true, true);
+
+    // Verify the metric was incremented
+    verify(mockMetricUtils, times(1))
+        .increment(eq(EntityServiceImpl.class), eq("batch_with_duplicate"), eq(1.0d));
   }
 }
